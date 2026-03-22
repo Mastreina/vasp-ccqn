@@ -1,0 +1,1207 @@
+--- original/src/.objects	2026-03-22 21:20:48
++++ patched/src/.objects	2026-03-22 21:20:50
+@@ -165,2 +165,3 @@
+ 	dimer_heyden.o \
++	ccqn_ts.o \
+ 	dvvtrajectory.o \
+--- /dev/null	2026-03-22 21:23:09
++++ patched/src/ccqn_ts.F	2026-03-22 21:20:50
+@@ -0,0 +1,1172 @@
++#include "symbol.inc"
++!***********************************************************************
++!
++!  CCQN-TS: Cone-shaped Constrained Quasi-Newton transition state optimizer
++!
++!  - Reads parameters and a fixed ascent direction from ccqn.ts.
++!  - Uses a cone-constrained step in the positive definite region ("well").
++!  - Switches to PRFO (trust-radius) once the approximate Hessian becomes indefinite.
++!
++!***********************************************************************
++
++      MODULE ccqn_ts
++        USE prec
++        USE constant
++        USE lattice
++        USE ini
++        USE poscar
++        USE base
++        USE string, ONLY: str
++        USE tutor, ONLY: vtutor
++        IMPLICIT NONE
++        PRIVATE
++
++        PUBLIC :: ccqn_ts_opt
++
++        REAL(q), PARAMETER :: CCQN_EPSR = 1E-12_q
++        INTEGER, PARAMETER :: CCQN_MAX_BONDS = 10000
++
++        TYPE ccqn_input
++          REAL(q) :: init_hessian_scale
++          REAL(q) :: delta_well
++          REAL(q) :: cos_phi
++          REAL(q) :: neg_eig_tol
++          REAL(q) :: delta_min
++          REAL(q) :: delta_max
++          REAL(q) :: rho_inc
++          REAL(q) :: rho_dec
++          REAL(q) :: sigma_inc
++          REAL(q) :: sigma_dec
++          REAL(q) :: prfo_a_init
++          INTEGER :: prfo_max_iter
++          INTEGER :: verbose
++          INTEGER :: nbonds = 0
++          INTEGER, ALLOCATABLE :: bonds(:,:)   ! bonds(2, nbonds), 1-based
++          LOGICAL :: sparse_vec = .FALSE.
++          INTEGER :: nvec_specified = 0
++        END TYPE
++
++        TYPE ccqn_state
++          LOGICAL :: initialized = .FALSE.
++          INTEGER :: n = 0
++          INTEGER :: nions = 0
++          INTEGER :: iter = 0
++          REAL(q) :: delta = 0._q
++          REAL(q) :: f_prev = 0._q
++          INTEGER :: iu_log = 0
++          LOGICAL :: log_open = .FALSE.
++          REAL(q), ALLOCATABLE :: b(:,:)        ! Hessian approximation (Cartesian)
++          REAL(q), ALLOCATABLE :: x_prev(:)     ! Previous positions (Cartesian)
++          REAL(q), ALLOCATABLE :: g_prev(:)     ! Previous gradient (Cartesian)
++          REAL(q), ALLOCATABLE :: s_prev(:)     ! Previous step (Cartesian)
++          REAL(q), ALLOCATABLE :: e(:)          ! Ascent direction (Cartesian, unit)
++          REAL(q) :: ratio_last = 0._q
++          LOGICAL :: have_ratio = .FALSE.
++          REAL(q) :: pred_last = 0._q
++          REAL(q) :: dE_last = 0._q
++          LOGICAL :: use_bonds = .FALSE.
++        END TYPE
++
++        TYPE(ccqn_input), SAVE :: Inp
++        TYPE(ccqn_state), SAVE :: St
++
++      CONTAINS
++
++        SUBROUTINE ccqn_ts_opt(DYN, T_INFO, INFO, LATT_CUR, IO, EPOT, FACT, LSTOP2)
++          TYPE(dynamics) :: DYN
++          TYPE(type_info) :: T_INFO
++          TYPE(info_struct) INFO
++          TYPE(latt) :: LATT_CUR
++          TYPE(in_struct) :: IO
++          REAL(q) :: EPOT
++          REAL(q) :: FACT
++          LOGICAL :: LSTOP2
++
++          INTEGER :: i, j, n, nions
++          REAL(q), ALLOCATABLE :: pos_cart(:,:), forces(:,:), x(:), g(:), y(:), s(:)
++          REAL(q), ALLOCATABLE :: e3(:,:)
++          REAL(q) :: fmax, step_norm, cos_es, min_eig, norm_e
++          INTEGER :: neg_count
++          LOGICAL :: in_well, found_bonds
++
++          IF (DYN%ISIF>2) THEN
++            CALL vtutor%error("ERROR: CCQN-TS supports only atomic relaxation (set ISIF <= 2).")
++          END IF
++
++          IF (FACT==0._q) THEN
++            CALL vtutor%error("ERROR: CCQN-TS internal scaling FACT is zero (unsupported setup).")
++          END IF
++
++          nions = T_INFO%NIONS
++          n = 3*nions
++
++          ALLOCATE(pos_cart(3,nions), forces(3,nions), x(n), g(n), y(n), s(n))
++
++          forces = DYN%D2C / FACT
++          pos_cart = DYN%POSION
++          CALL DIRKAR(nions, pos_cart, LATT_CUR%A)
++          CALL pack3(nions, pos_cart, x)
++          CALL pack3(nions, -forces, g)
++          CALL apply_selective_mask(T_INFO, g)
++
++          ! Convergence criterion should ignore frozen degrees of freedom (Selective dynamics).
++          fmax = 0._q
++          DO i=1,nions
++            fmax = MAX(fmax, SQRT(g(3*(i-1)+1)**2 + g(3*(i-1)+2)**2 + g(3*(i-1)+3)**2))
++          END DO
++
++          IF (.NOT. St%initialized) THEN
++            ALLOCATE(e3(3,nions))
++            CALL ccqn_read_input(IO%IU6, nions, e3, found_bonds)
++            IF (found_bonds) THEN
++              CALL compute_e_ic(nions, Inp%nbonds, Inp%bonds, pos_cart, forces, e3)
++            END IF
++            CALL ccqn_init_state(T_INFO, e3, IO%IU6, found_bonds)
++            DEALLOCATE(e3)
++            CALL ccqn_open_log(IO%IU6)
++            IF (St%log_open) CALL ccqn_log_header(St%iu_log)
++            St%f_prev = EPOT
++            St%x_prev = x
++            St%g_prev = g
++            St%s_prev = 0._q
++            St%iter = 0
++            St%have_ratio = .FALSE.
++          ELSE
++            IF (St%nions /= nions) THEN
++              CALL vtutor%error("ERROR: CCQN-TS internal state mismatch (NIONS changed).")
++            END IF
++
++            y = g - St%g_prev
++            ! NOTE: ratio/prediction must be computed with the Hessian used to generate the previous step
++            ! (i.e., before the quasi-Newton update with (s_prev, y)).
++            CALL ccqn_update_ratio_and_delta(St%n, St%b, St%g_prev, St%s_prev, EPOT - St%f_prev)
++            CALL ts_bfgs_update(St%n, St%b, St%s_prev, y)
++
++            St%f_prev = EPOT
++            St%x_prev = x
++            St%g_prev = g
++          END IF
++
++          St%iter = St%iter + 1
++
++          ! Recompute direction vector each step in BONDS mode
++          IF (St%use_bonds) THEN
++            ALLOCATE(e3(3,nions))
++            CALL compute_e_ic(nions, Inp%nbonds, Inp%bonds, pos_cart, forces, e3)
++            CALL pack3(nions, e3, St%e)
++            CALL apply_selective_mask(T_INFO, St%e)
++            norm_e = SQRT(SUM(St%e*St%e))
++            IF (norm_e < 1E-12_q) THEN
++              IF (IO%IU6>=0) WRITE(IO%IU6,'(3X,A)') &
++                'CCQN-TS: WARNING: IC direction is zero, keeping previous direction.'
++            ELSE
++              St%e = St%e / norm_e
++            END IF
++            DEALLOCATE(e3)
++          END IF
++
++          CALL ccqn_hessian_diagnostics(St%n, St%b, Inp%neg_eig_tol, neg_count, min_eig, in_well)
++
++          IF (DYN%EDIFFG < 0._q) THEN
++            LSTOP2 = (fmax <= ABS(DYN%EDIFFG)) .AND. (neg_count == 1)
++            IF (LSTOP2) THEN
++              INFO%LSTOP = .TRUE.
++              DYN%POSIOC = DYN%POSION
++              IF (IO%IU6>=0) CALL ccqn_write_status(IO%IU6, St%iter, EPOT, fmax, neg_count, min_eig, "CONVERGED", 0._q, 0._q, 0._q)
++              IF (St%log_open) CALL ccqn_log_line(St%iu_log, St%iter, EPOT, fmax, neg_count, min_eig, "CONVERGED", St%delta, 0._q, 0._q, St%have_ratio, St%ratio_last, St%pred_last, St%dE_last)
++              DEALLOCATE(pos_cart, forces, x, g, y, s)
++              RETURN
++            END IF
++          END IF
++
++          IF (in_well) THEN
++            s = solve_cone_step_alm(St%n, g, St%b, St%e, Inp%delta_well, Inp%cos_phi)
++          ELSE
++            s = prfo_step(St%n, g, St%b, St%delta, 1, Inp%prfo_a_init, Inp%prfo_max_iter)
++          END IF
++          CALL apply_selective_mask(T_INFO, s)
++
++          step_norm = SQRT(SUM(s*s))
++          cos_es = 0._q
++          IF (step_norm > 0._q) cos_es = SUM(St%e*s) / step_norm
++
++          IF (Inp%verbose>0 .AND. IO%IU6>=0) THEN
++            IF (in_well) THEN
++              CALL ccqn_write_status(IO%IU6, St%iter, EPOT, fmax, neg_count, min_eig, "WELL", St%delta, step_norm, cos_es)
++            ELSE
++              CALL ccqn_write_status(IO%IU6, St%iter, EPOT, fmax, neg_count, min_eig, "PRFO", St%delta, step_norm, cos_es)
++            END IF
++            IF (St%have_ratio) THEN
++              WRITE(IO%IU6,'(3X,A,1X,F10.4)') 'CCQN-TS ratio(pred/act)=', St%ratio_last
++            END IF
++          END IF
++          IF (St%log_open) THEN
++            IF (in_well) THEN
++              CALL ccqn_log_line(St%iu_log, St%iter, EPOT, fmax, neg_count, min_eig, "WELL", St%delta, step_norm, cos_es, St%have_ratio, St%ratio_last, St%pred_last, St%dE_last)
++            ELSE
++              CALL ccqn_log_line(St%iu_log, St%iter, EPOT, fmax, neg_count, min_eig, "PRFO", St%delta, step_norm, cos_es, St%have_ratio, St%ratio_last, St%pred_last, St%dE_last)
++            END IF
++          END IF
++
++          DYN%POSIOC = DYN%POSION
++
++          CALL unpack3(nions, x + s, pos_cart)
++          CALL KARDIR(nions, pos_cart, LATT_CUR%B)
++          DYN%POSION = pos_cart
++
++          St%s_prev = s
++
++          DEALLOCATE(pos_cart, forces, x, g, y, s)
++
++        END SUBROUTINE ccqn_ts_opt
++
++
++        SUBROUTINE ccqn_init_state(T_INFO, e3, IU6, use_bonds)
++          TYPE(type_info) :: T_INFO
++          REAL(q), INTENT(IN) :: e3(3,T_INFO%NIONS)
++          INTEGER, INTENT(IN) :: IU6
++          LOGICAL, INTENT(IN) :: use_bonds
++
++          INTEGER :: i
++          REAL(q) :: norm_e
++
++          St%use_bonds = use_bonds
++          St%nions = T_INFO%NIONS
++          St%n = 3*St%nions
++          IF (.NOT. ALLOCATED(St%b)) ALLOCATE(St%b(St%n,St%n))
++          IF (.NOT. ALLOCATED(St%x_prev)) ALLOCATE(St%x_prev(St%n))
++          IF (.NOT. ALLOCATED(St%g_prev)) ALLOCATE(St%g_prev(St%n))
++          IF (.NOT. ALLOCATED(St%s_prev)) ALLOCATE(St%s_prev(St%n))
++          IF (.NOT. ALLOCATED(St%e)) ALLOCATE(St%e(St%n))
++
++          St%b = 0._q
++          DO i=1,St%n
++            St%b(i,i) = Inp%init_hessian_scale
++          END DO
++
++          St%delta = Inp%delta_well
++
++          CALL pack3(St%nions, e3, St%e)
++          CALL apply_selective_mask(T_INFO, St%e)
++          norm_e = SQRT(SUM(St%e*St%e))
++          IF (norm_e < 1E-12_q) THEN
++            CALL vtutor%error("ERROR: CCQN-TS: ccqn.ts direction is zero after masking.")
++          END IF
++          St%e = St%e / norm_e
++
++          St%initialized = .TRUE.
++          IF (IU6>=0 .AND. Inp%verbose>0) CALL ccqn_write_input_summary(IU6)
++        END SUBROUTINE ccqn_init_state
++
++
++        SUBROUTINE ccqn_set_defaults()
++          Inp%init_hessian_scale = 70._q
++          Inp%delta_well = 0.1_q
++          Inp%cos_phi = 0.1_q
++          Inp%neg_eig_tol = 1E-8_q
++          Inp%delta_min = 0.02_q
++          Inp%delta_max = 0.3_q
++          Inp%rho_inc = 1.2_q
++          Inp%rho_dec = 2._q
++          Inp%sigma_inc = 1.2_q
++          Inp%sigma_dec = 0.5_q
++          Inp%prfo_a_init = 1._q
++          Inp%prfo_max_iter = 50
++          Inp%verbose = 1
++        END SUBROUTINE ccqn_set_defaults
++
++
++        SUBROUTINE ccqn_validate_input()
++          Inp%init_hessian_scale = MAX(Inp%init_hessian_scale, 1E-6_q)
++          Inp%delta_well = MAX(Inp%delta_well, 1E-6_q)
++          Inp%cos_phi = MIN(1._q, MAX(-1._q, Inp%cos_phi))
++          Inp%neg_eig_tol = MAX(Inp%neg_eig_tol, 0._q)
++          Inp%delta_min = MAX(Inp%delta_min, 1E-6_q)
++          Inp%delta_max = MAX(Inp%delta_max, Inp%delta_min)
++          Inp%rho_inc = MAX(Inp%rho_inc, 1._q)
++          Inp%rho_dec = MAX(Inp%rho_dec, 1._q)
++          Inp%sigma_inc = MAX(Inp%sigma_inc, 1._q)
++          Inp%sigma_dec = MIN(1._q, MAX(1E-6_q, Inp%sigma_dec))
++          Inp%prfo_a_init = MAX(Inp%prfo_a_init, 1E-6_q)
++          Inp%prfo_max_iter = MAX(1, Inp%prfo_max_iter)
++        END SUBROUTINE ccqn_validate_input
++
++
++        SUBROUTINE ccqn_replace_equals(line)
++          CHARACTER(LEN=*), INTENT(INOUT) :: line
++          INTEGER :: i
++          DO i=1,LEN(line)
++            IF (line(i:i) == '=') line(i:i) = ' '
++          END DO
++        END SUBROUTINE ccqn_replace_equals
++
++
++        SUBROUTINE ccqn_read_input(IU6, nions, e3, found_bonds)
++          INTEGER, INTENT(IN) :: IU6, nions
++          REAL(q), INTENT(OUT) :: e3(3,nions)
++          LOGICAL, INTENT(OUT) :: found_bonds
++
++          INTEGER :: iu, ierr, ios, count, p1, p2, pc, k
++          INTEGER :: nbonds_read, bi, bj
++          INTEGER :: bond_buf(2, CCQN_MAX_BONDS)
++          INTEGER :: vec_idx
++          LOGICAL :: in_vec, in_bonds, sparse_vec, vec_format_known
++          CHARACTER(LEN=512) :: line, uline
++          CHARACTER(LEN=64) :: key
++          REAL(q) :: val, a, b, c
++
++          CALL ccqn_set_defaults()
++          e3 = 0._q
++          in_vec = .FALSE.
++          in_bonds = .FALSE.
++          found_bonds = .FALSE.
++          sparse_vec = .FALSE.
++          vec_format_known = .FALSE.
++          count = 0
++          nbonds_read = 0
++
++          OPEN(NEWUNIT=iu, FILE='ccqn.ts', STATUS='OLD', ACTION='READ', IOSTAT=ierr)
++          IF (ierr /= 0) THEN
++            CALL vtutor%error("ERROR: CCQN-TS: could not open ccqn.ts (required input file).")
++          END IF
++
++          DO
++            READ(iu,'(A)',IOSTAT=ierr) line
++            IF (ierr /= 0) EXIT
++
++            pc = 0
++            p1 = INDEX(line,'!')
++            p2 = INDEX(line,'#')
++            IF (p1>0 .AND. p2>0) pc = MIN(p1,p2)
++            IF (p1>0 .AND. p2==0) pc = p1
++            IF (p2>0 .AND. p1==0) pc = p2
++            IF (pc>0) line = line(:pc-1)
++            line = ADJUSTL(line)
++            IF (LEN_TRIM(line) == 0) CYCLE
++
++            uline = ccqn_uppercase(line)
++
++            ! --- BONDS block: read pairs of atom indices ---
++            IF (in_bonds) THEN
++              bi = 0; bj = 0
++              READ(uline,*,IOSTAT=ios) bi, bj
++              IF (ios == 0 .AND. bi >= 1 .AND. bj >= 1) THEN
++                nbonds_read = nbonds_read + 1
++                IF (nbonds_read > CCQN_MAX_BONDS) THEN
++                  CALL vtutor%error("ERROR: CCQN-TS: too many bonds in ccqn.ts.")
++                END IF
++                bond_buf(1, nbonds_read) = bi
++                bond_buf(2, nbonds_read) = bj
++                CYCLE
++              ELSE
++                in_bonds = .FALSE.
++                ! Fall through to key-value parsing below
++              END IF
++            END IF
++
++            ! --- VECTOR block: dense (3 values) or sparse (idx + 3 values) ---
++            IF (in_vec) THEN
++              IF (sparse_vec) THEN
++                ! Confirmed sparse mode: read atom_index vx vy vz
++                vec_idx = 0; a = 0._q; b = 0._q; c = 0._q
++                READ(uline,*,IOSTAT=ios) vec_idx, a, b, c
++                IF (ios == 0 .AND. vec_idx >= 1) THEN
++                  count = count + 1
++                  IF (vec_idx < 1 .OR. vec_idx > nions) THEN
++                    CALL vtutor%error("ERROR: CCQN-TS: VECTOR atom index " // str(vec_idx) // &
++                                      " out of range [1," // str(nions) // "].")
++                  END IF
++                  e3(1,vec_idx) = a; e3(2,vec_idx) = b; e3(3,vec_idx) = c
++                  CYCLE
++                ELSE
++                  in_vec = .FALSE.
++                  ! Fall through to key-value parsing
++                END IF
++              ELSE IF (vec_format_known) THEN
++                ! Confirmed dense mode (backward compatible)
++                a = 0._q; b = 0._q; c = 0._q
++                READ(uline,*,IOSTAT=ios) a, b, c
++                IF (ios == 0) THEN
++                  count = count + 1
++                  IF (count <= nions) THEN
++                    e3(1,count) = a; e3(2,count) = b; e3(3,count) = c
++                  END IF
++                  IF (count >= nions) EXIT
++                END IF
++                CYCLE
++              ELSE
++                ! Format unknown: auto-detect from first data line
++                vec_idx = 0; a = 0._q; b = 0._q; c = 0._q
++                READ(uline,*,IOSTAT=ios) vec_idx, a, b, c
++                IF (ios == 0 .AND. vec_idx >= 1) THEN
++                  ! 4 values parsed -> sparse mode
++                  sparse_vec = .TRUE.; vec_format_known = .TRUE.
++                  count = count + 1
++                  IF (vec_idx < 1 .OR. vec_idx > nions) THEN
++                    CALL vtutor%error("ERROR: CCQN-TS: VECTOR atom index " // str(vec_idx) // &
++                                      " out of range [1," // str(nions) // "].")
++                  END IF
++                  e3(1,vec_idx) = a; e3(2,vec_idx) = b; e3(3,vec_idx) = c
++                  CYCLE
++                ELSE
++                  ! 4 values failed -> dense mode
++                  sparse_vec = .FALSE.; vec_format_known = .TRUE.
++                  a = 0._q; b = 0._q; c = 0._q
++                  READ(uline,*,IOSTAT=ios) a, b, c
++                  IF (ios == 0) THEN
++                    count = count + 1
++                    IF (count <= nions) THEN
++                      e3(1,count) = a; e3(2,count) = b; e3(3,count) = c
++                    END IF
++                    IF (count >= nions) EXIT
++                  END IF
++                  CYCLE
++                END IF
++              END IF
++            END IF
++
++            ! --- Key-value / keyword parsing ---
++            CALL ccqn_replace_equals(uline)
++
++            key = ''
++            READ(uline,*,IOSTAT=ios) key
++            IF (ios /= 0) CYCLE
++            key = TRIM(key)
++
++            IF (key == 'VECTOR' .OR. key == 'MODE' .OR. key == 'DIRECTION') THEN
++              IF (nbonds_read > 0) THEN
++                CALL vtutor%error("ERROR: CCQN-TS: ccqn.ts has both BONDS and VECTOR blocks.")
++              END IF
++              in_vec = .TRUE.
++              CYCLE
++            END IF
++
++            IF (key == 'BONDS') THEN
++              IF (in_vec .OR. count > 0) THEN
++                CALL vtutor%error("ERROR: CCQN-TS: ccqn.ts has both BONDS and VECTOR blocks.")
++              END IF
++              in_bonds = .TRUE.
++              CYCLE
++            END IF
++
++            val = 0._q
++            READ(uline,*,IOSTAT=ios) key, val
++            IF (ios /= 0) CYCLE
++
++            SELECT CASE (TRIM(key))
++              CASE('INIT_HESS_SCALE','INIT_HESSIAN_SCALE','HESS_SCALE')
++                Inp%init_hessian_scale = val
++              CASE('DELTA_WELL','DELTAWELL')
++                Inp%delta_well = val
++              CASE('COSPHI','COS_PHI')
++                Inp%cos_phi = val
++              CASE('NEG_EIG_TOL','NEG_EIGEN_TOL','NEG_EIG_THR')
++                Inp%neg_eig_tol = val
++              CASE('DELTA_MIN')
++                Inp%delta_min = val
++              CASE('DELTA_MAX')
++                Inp%delta_max = val
++              CASE('RHO_INC')
++                Inp%rho_inc = val
++              CASE('RHO_DEC')
++                Inp%rho_dec = val
++              CASE('SIGMA_INC')
++                Inp%sigma_inc = val
++              CASE('SIGMA_DEC')
++                Inp%sigma_dec = val
++              CASE('PRFO_A_INIT','A_INIT')
++                Inp%prfo_a_init = val
++              CASE('PRFO_MAX_ITER','MAX_ITER')
++                Inp%prfo_max_iter = INT(val)
++              CASE('VERBOSE')
++                Inp%verbose = INT(val)
++              CASE DEFAULT
++                IF (IU6>=0) WRITE(IU6,'(3X,A,A)') 'CCQN-TS: WARNING: unknown key in ccqn.ts: ', TRIM(key)
++            END SELECT
++          END DO
++
++          CLOSE(iu)
++          CALL ccqn_validate_input()
++
++          ! --- Post-processing: validate BONDS or VECTOR ---
++          IF (nbonds_read > 0) THEN
++            found_bonds = .TRUE.
++            Inp%nbonds = nbonds_read
++            IF (ALLOCATED(Inp%bonds)) DEALLOCATE(Inp%bonds)
++            ALLOCATE(Inp%bonds(2, nbonds_read))
++            Inp%bonds(:, 1:nbonds_read) = bond_buf(:, 1:nbonds_read)
++            DO k = 1, nbonds_read
++              IF (Inp%bonds(1,k) < 1 .OR. Inp%bonds(1,k) > nions .OR. &
++                  Inp%bonds(2,k) < 1 .OR. Inp%bonds(2,k) > nions) THEN
++                CALL vtutor%error("ERROR: CCQN-TS: bond index out of range [1," // str(nions) // "] in ccqn.ts.")
++              END IF
++              IF (Inp%bonds(1,k) == Inp%bonds(2,k)) THEN
++                CALL vtutor%error("ERROR: CCQN-TS: bond with identical atom indices in ccqn.ts.")
++              END IF
++            END DO
++          ELSE IF (sparse_vec) THEN
++            IF (count == 0) THEN
++              CALL vtutor%error("ERROR: CCQN-TS: VECTOR block has no entries.")
++            END IF
++            Inp%sparse_vec = .TRUE.
++            Inp%nvec_specified = count
++          ELSE IF (count < nions) THEN
++            CALL vtutor%error("ERROR: CCQN-TS: ccqn.ts requires either a VECTOR block " // &
++                              "(NIONS lines of 3 numbers, or sparse: idx vx vy vz) or a BONDS block.")
++          END IF
++        END SUBROUTINE ccqn_read_input
++
++
++        SUBROUTINE ccqn_write_input_summary(IU6)
++          INTEGER, INTENT(IN) :: IU6
++          INTEGER :: k
++          IF (IU6 < 0) RETURN
++          WRITE(IU6,'(/,3X,A)') 'CCQN-TS input (from ccqn.ts):'
++          IF (St%use_bonds) THEN
++            WRITE(IU6,'(3X,A,I4,A)') 'MODE            = BONDS (', Inp%nbonds, ' pairs)'
++            DO k=1,Inp%nbonds
++              WRITE(IU6,'(5X,I5,A,I5)') Inp%bonds(1,k), ' -- ', Inp%bonds(2,k)
++            END DO
++          ELSE IF (Inp%sparse_vec) THEN
++            WRITE(IU6,'(3X,A,I4,A)') 'MODE            = VECTOR_SPARSE (fixed, ', Inp%nvec_specified, ' atoms specified)'
++          ELSE
++            WRITE(IU6,'(3X,A)') 'MODE            = VECTOR (fixed direction)'
++          END IF
++          WRITE(IU6,'(3X,A,1X,E12.4)') 'INIT_HESS_SCALE =', Inp%init_hessian_scale
++          WRITE(IU6,'(3X,A,1X,E12.4)') 'DELTA_WELL      =', Inp%delta_well
++          WRITE(IU6,'(3X,A,1X,F10.6)') 'COSPHI          =', Inp%cos_phi
++          WRITE(IU6,'(3X,A,1X,E12.4)') 'NEG_EIG_TOL     =', Inp%neg_eig_tol
++          WRITE(IU6,'(3X,A,1X,E12.4)') 'DELTA_MIN       =', Inp%delta_min
++          WRITE(IU6,'(3X,A,1X,E12.4)') 'DELTA_MAX       =', Inp%delta_max
++          WRITE(IU6,'(3X,A,1X,E12.4)') 'RHO_INC         =', Inp%rho_inc
++          WRITE(IU6,'(3X,A,1X,E12.4)') 'RHO_DEC         =', Inp%rho_dec
++          WRITE(IU6,'(3X,A,1X,E12.4)') 'SIGMA_INC       =', Inp%sigma_inc
++          WRITE(IU6,'(3X,A,1X,E12.4)') 'SIGMA_DEC       =', Inp%sigma_dec
++          WRITE(IU6,'(3X,A,1X,E12.4)') 'PRFO_A_INIT     =', Inp%prfo_a_init
++          WRITE(IU6,'(3X,A,1X,I6)')   'PRFO_MAX_ITER   =', Inp%prfo_max_iter
++          WRITE(IU6,'(3X,A,1X,I6)')   'VERBOSE         =', Inp%verbose
++        END SUBROUTINE ccqn_write_input_summary
++
++
++        SUBROUTINE ccqn_open_log(IU6)
++          INTEGER, INTENT(IN) :: IU6
++          INTEGER :: ierr, iu
++          IF (IU6 < 0) RETURN
++          IF (Inp%verbose <= 0) RETURN
++          IF (St%log_open) RETURN
++          OPEN(NEWUNIT=iu, FILE='ccqn.log', STATUS='UNKNOWN', ACTION='WRITE', POSITION='APPEND', IOSTAT=ierr)
++          IF (ierr /= 0) THEN
++            St%iu_log = 0
++            St%log_open = .FALSE.
++            IF (IU6>=0) WRITE(IU6,'(3X,A)') 'CCQN-TS: WARNING: could not open ccqn.log.'
++          ELSE
++            St%iu_log = iu
++            St%log_open = .TRUE.
++          END IF
++        END SUBROUTINE ccqn_open_log
++
++
++        SUBROUTINE ccqn_log_header(IU)
++          INTEGER, INTENT(IN) :: IU
++          WRITE(IU,'(A)') '# CCQN-TS log (IBRION=45)'
++          WRITE(IU,'(A)') '# iter   E(eV)                Fmax     neg   minEig         phase     delta        stepNorm      cos(e,s) have_ratio ratio(pred/act) pred_dE       dE'
++          FLUSH(IU)
++        END SUBROUTINE ccqn_log_header
++
++
++        SUBROUTINE ccqn_log_line(IU, iter, epot, fmax, neg_count, min_eig, phase, delta, step_norm, cos_es, have_ratio, ratio, pred, dE)
++          INTEGER, INTENT(IN) :: IU, iter, neg_count
++          REAL(q), INTENT(IN) :: epot, fmax, min_eig, delta, step_norm, cos_es, ratio, pred, dE
++          LOGICAL, INTENT(IN) :: have_ratio
++          CHARACTER(LEN=*), INTENT(IN) :: phase
++          WRITE(IU,'(I6,1X,E20.12,1X,E10.3,1X,I3,1X,E12.4,1X,A10,1X,E10.3,1X,E10.3,1X,F9.4,1X,I1,1X,F10.4,1X,E12.4,1X,E12.4)') &
++            iter, epot, fmax, neg_count, min_eig, phase, delta, step_norm, cos_es, MERGE(1,0,have_ratio), ratio, pred, dE
++          FLUSH(IU)
++        END SUBROUTINE ccqn_log_line
++
++
++        SUBROUTINE pack3(nions, v3, v)
++          INTEGER, INTENT(IN) :: nions
++          REAL(q), INTENT(IN) :: v3(3,nions)
++          REAL(q), INTENT(OUT) :: v(3*nions)
++          INTEGER :: i, j
++          DO i=1,nions
++            DO j=1,3
++              v(3*(i-1)+j) = v3(j,i)
++            END DO
++          END DO
++        END SUBROUTINE pack3
++
++
++        SUBROUTINE unpack3(nions, v, v3)
++          INTEGER, INTENT(IN) :: nions
++          REAL(q), INTENT(IN) :: v(3*nions)
++          REAL(q), INTENT(OUT) :: v3(3,nions)
++          INTEGER :: i, j
++          DO i=1,nions
++            DO j=1,3
++              v3(j,i) = v(3*(i-1)+j)
++            END DO
++          END DO
++        END SUBROUTINE unpack3
++
++
++        SUBROUTINE apply_selective_mask(T_INFO, v)
++          TYPE(type_info), INTENT(IN) :: T_INFO
++          REAL(q), INTENT(INOUT) :: v(3*T_INFO%NIONS)
++          INTEGER :: i, j, k
++          IF (.NOT. T_INFO%LSDYN) RETURN
++          DO i=1,T_INFO%NIONS
++            DO j=1,3
++              k = 3*(i-1)+j
++              IF (.NOT. T_INFO%LSFOR(j,i)) v(k) = 0._q
++            END DO
++          END DO
++        END SUBROUTINE apply_selective_mask
++
++
++        SUBROUTINE compute_e_ic(nions, nbonds, bonds, pos, forces, e3)
++          INTEGER, INTENT(IN)  :: nions, nbonds
++          INTEGER, INTENT(IN)  :: bonds(2, nbonds)
++          REAL(q), INTENT(IN)  :: pos(3, nions)
++          REAL(q), INTENT(IN)  :: forces(3, nions)
++          REAL(q), INTENT(OUT) :: e3(3, nions)
++
++          INTEGER :: k, ii, jj
++          REAL(q) :: v_ij(3), v_norm2, proj_j, proj_i, p_ij(3), p_norm
++
++          e3 = 0._q
++
++          DO k = 1, nbonds
++            ii = bonds(1, k)
++            jj = bonds(2, k)
++
++            v_ij = pos(:, jj) - pos(:, ii)
++            v_norm2 = SUM(v_ij * v_ij)
++            IF (v_norm2 < 1E-12_q) CYCLE
++
++            proj_j = SUM(v_ij * forces(:, jj)) / v_norm2
++            proj_i = SUM(v_ij * forces(:, ii)) / v_norm2
++
++            p_ij = v_ij * (proj_j - proj_i)
++            p_norm = SQRT(SUM(p_ij * p_ij))
++            IF (p_norm < 1E-12_q) CYCLE
++
++            p_ij = p_ij / p_norm
++            e3(:, ii) = e3(:, ii) + p_ij
++            e3(:, jj) = e3(:, jj) - p_ij
++          END DO
++        END SUBROUTINE compute_e_ic
++
++
++        SUBROUTINE ccqn_write_status(IU, iter, epot, fmax, neg_count, min_eig, phase, delta, step_norm, cos_es)
++          INTEGER, INTENT(IN) :: IU, iter, neg_count
++          REAL(q), INTENT(IN) :: epot, fmax, min_eig, delta, step_norm, cos_es
++          CHARACTER(LEN=*), INTENT(IN) :: phase
++          WRITE(IU,'(3X,A,I6,2X,A,1X,E14.6,2X,A,1X,E12.4,2X,A,I2,2X,A,1X,E12.4,2X,A,1X,A)') &
++            'CCQN-TS step', iter, 'F=', epot, 'Fmax=', fmax, 'neg=', neg_count, 'minEig=', min_eig, 'phase=', phase
++          WRITE(IU,'(3X,A,1X,E12.4,2X,A,1X,E12.4,2X,A,1X,F8.4)') &
++            'CCQN-TS delta=', delta, '||s||=', step_norm, 'cos(e,s)=', cos_es
++        END SUBROUTINE ccqn_write_status
++
++
++        SUBROUTINE ccqn_update_ratio_and_delta(n, b, g_prev, s_prev, denom)
++          INTEGER, INTENT(IN) :: n
++          REAL(q), INTENT(IN) :: b(n,n)
++          REAL(q), INTENT(IN) :: g_prev(n), s_prev(n)
++          REAL(q), INTENT(IN) :: denom
++          REAL(q), ALLOCATABLE :: bs(:)
++          REAL(q) :: pred, ratio
++          INTEGER :: neg_count
++          REAL(q) :: min_eig
++          LOGICAL :: in_well
++
++          IF (SUM(ABS(s_prev)) < 1E-14_q) RETURN
++
++          ALLOCATE(bs(n))
++          bs = MATMUL(b, s_prev)
++          pred = SUM(g_prev*s_prev) + 0.5_q*SUM(s_prev*bs)
++          DEALLOCATE(bs)
++
++          St%pred_last = pred
++          St%dE_last = denom
++
++          ratio = 0._q
++          IF (denom /= 0._q) ratio = pred / denom
++          St%ratio_last = ratio
++          St%have_ratio = .TRUE.
++
++          CALL ccqn_hessian_diagnostics(n, b, Inp%neg_eig_tol, neg_count, min_eig, in_well)
++          IF (.NOT. in_well) THEN
++            St%delta = trust_radius_update(St%delta, ratio, Inp%rho_inc, Inp%rho_dec, Inp%sigma_inc, Inp%sigma_dec, Inp%delta_min, Inp%delta_max)
++          END IF
++        END SUBROUTINE ccqn_update_ratio_and_delta
++
++
++        REAL(q) FUNCTION trust_radius_update(delta, ratio, rho_inc, rho_dec, sigma_inc, sigma_dec, delta_min, delta_max)
++          REAL(q), INTENT(IN) :: delta, ratio, rho_inc, rho_dec, sigma_inc, sigma_dec, delta_min, delta_max
++          REAL(q) :: d
++          d = delta
++          IF (ratio == 0._q) THEN
++            trust_radius_update = MAX(delta_min, d*sigma_dec)
++            RETURN
++          END IF
++          IF (ratio >= 1._q/rho_inc .AND. ratio <= rho_inc) THEN
++            trust_radius_update = MIN(delta_max, d*sigma_inc)
++            RETURN
++          END IF
++          IF (ratio <= 1._q/rho_dec .OR. ratio >= rho_dec) THEN
++            trust_radius_update = MAX(delta_min, d*sigma_dec)
++            RETURN
++          END IF
++          trust_radius_update = d
++        END FUNCTION trust_radius_update
++
++
++        SUBROUTINE ccqn_hessian_diagnostics(n, b, tol, neg_count, min_eig, in_well)
++          INTEGER, INTENT(IN) :: n
++          REAL(q), INTENT(IN) :: b(n,n)
++          REAL(q), INTENT(IN) :: tol
++          INTEGER, INTENT(OUT) :: neg_count
++          REAL(q), INTENT(OUT) :: min_eig
++          LOGICAL, INTENT(OUT) :: in_well
++
++          REAL(q), ALLOCATABLE :: a(:,:), w(:)
++          INTEGER :: i
++
++          ALLOCATE(a(n,n), w(n))
++          a = 0.5_q*(b + TRANSPOSE(b))
++          CALL dsyev_wrap('N', n, a, w)
++          min_eig = w(1)
++          neg_count = 0
++          DO i=1,n
++            IF (w(i) < -tol) neg_count = neg_count + 1
++          END DO
++          in_well = (min_eig > tol)
++          DEALLOCATE(a, w)
++        END SUBROUTINE ccqn_hessian_diagnostics
++
++
++        SUBROUTINE dsyev_wrap(jobz, n, a, w)
++          CHARACTER(LEN=1), INTENT(IN) :: jobz
++          INTEGER, INTENT(IN) :: n
++          REAL(q), INTENT(INOUT) :: a(n,n)
++          REAL(q), INTENT(OUT) :: w(n)
++
++          INTEGER :: info, lwork
++          REAL(q), ALLOCATABLE :: work(:)
++          REAL(q) :: workq(1)
++
++          lwork = -1
++          CALL DSYEV(jobz, 'U', n, a, n, w, workq, lwork, info)
++          IF (info /= 0) CALL vtutor%bug("CCQN-TS: DSYEV query failed. INFO=" // str(info), __FILE__, __LINE__)
++          lwork = MAX(1, INT(workq(1)))
++          ALLOCATE(work(lwork))
++          CALL DSYEV(jobz, 'U', n, a, n, w, work, lwork, info)
++          DEALLOCATE(work)
++          IF (info /= 0) CALL vtutor%bug("CCQN-TS: DSYEV failed. INFO=" // str(info), __FILE__, __LINE__)
++        END SUBROUTINE dsyev_wrap
++
++
++        SUBROUTINE ts_bfgs_update(n, b, s, y)
++          INTEGER, INTENT(IN) :: n
++          REAL(q), INTENT(INOUT) :: b(n,n)
++          REAL(q), INTENT(IN) :: s(n), y(n)
++
++          REAL(q), PARAMETER :: eps = 1E-12_q
++          REAL(q) :: sy, c, denom, js
++          REAL(q), ALLOCATABLE :: a(:,:), w(:), qts(:), tmp(:), tbs(:), bs(:), jv(:), u(:)
++          INTEGER :: i
++
++          IF (SUM(ABS(s)) < eps) RETURN
++
++          b = 0.5_q*(b + TRANSPOSE(b))
++
++          sy = SUM(s*y)
++          IF (ABS(sy) < eps) RETURN
++
++          ALLOCATE(a(n,n), w(n), qts(n), tmp(n), tbs(n), bs(n), jv(n), u(n))
++          a = b
++          CALL dsyev_wrap('V', n, a, w)     ! a becomes eigenvectors, w eigenvalues (ascending)
++
++          qts = MATMUL(TRANSPOSE(a), s)
++          DO i=1,n
++            tmp(i) = ABS(w(i)) * qts(i)
++          END DO
++          tbs = MATMUL(a, tmp)
++          c = SUM(s*tbs)
++
++          denom = sy*sy + c*c
++          IF (ABS(denom) < eps) THEN
++            DEALLOCATE(a, w, qts, tmp, tbs, bs, jv, u)
++            RETURN
++          END IF
++
++          u = (y*sy + c*tbs) / denom
++
++          bs = MATMUL(b, s)
++          jv = y - bs
++          js = SUM(jv*s)
++
++          DO i=1,n
++            b(:,i) = b(:,i) + jv*u(i) + u*jv(i) - js*u*u(i)
++          END DO
++          b = 0.5_q*(b + TRANSPOSE(b))
++
++          DEALLOCATE(a, w, qts, tmp, tbs, bs, jv, u)
++        END SUBROUTINE ts_bfgs_update
++
++
++        FUNCTION prfo_step(n, g, b, delta, mu, a_init, max_iter) RESULT(s)
++          INTEGER, INTENT(IN) :: n, mu, max_iter
++          REAL(q), INTENT(IN) :: g(n), b(n,n), delta, a_init
++          REAL(q) :: s(n)
++
++          REAL(q) :: a_low, a_high, a_mid
++          REAL(q) :: norm_s, norm_high, norm_mid
++          INTEGER :: it
++          REAL(q) :: s_high(n), s_mid(n)
++
++          s = prfo_step_with_a(n, g, b, a_init, mu)
++          norm_s = SQRT(SUM(s*s))
++          IF (delta <= 0._q .OR. norm_s <= delta + 1E-10_q) RETURN
++
++          a_low = 1E-6_q
++          a_high = a_init
++          s_high = s
++          norm_high = norm_s
++          DO WHILE (norm_high < delta .AND. a_high < 1E6_q)
++            a_high = 2._q*a_high
++            s_high = prfo_step_with_a(n, g, b, a_high, mu)
++            norm_high = SQRT(SUM(s_high*s_high))
++          END DO
++          IF (norm_high < delta) THEN
++            s = s_high
++            RETURN
++          END IF
++
++          DO it=1,max_iter
++            a_mid = 0.5_q*(a_low + a_high)
++            s_mid = prfo_step_with_a(n, g, b, a_mid, mu)
++            norm_mid = SQRT(SUM(s_mid*s_mid))
++            IF (ABS(norm_mid - delta) < 1E-10_q) THEN
++              s = s_mid
++              RETURN
++            END IF
++            IF (norm_mid < delta) THEN
++              a_low = a_mid
++            ELSE
++              a_high = a_mid
++            END IF
++          END DO
++
++          s = prfo_step_with_a(n, g, b, a_high, mu)
++        END FUNCTION prfo_step
++
++
++        FUNCTION prfo_step_with_a(n, g, b, a_scale, mu) RESULT(s)
++          INTEGER, INTENT(IN) :: n, mu
++          REAL(q), INTENT(IN) :: g(n), b(n,n), a_scale
++          REAL(q) :: s(n)
++
++          REAL(q), ALLOCATABLE :: a(:,:), w(:), gtil(:)
++          REAL(q), ALLOCATABLE :: smax(:), smin(:)
++          INTEGER :: m, k
++
++          m = MAX(1, MIN(mu, n))
++          ALLOCATE(a(n,n), w(n), gtil(n))
++          a = 0.5_q*(b + TRANSPOSE(b))
++          CALL dsyev_wrap('V', n, a, w)   ! a eigenvectors, w eigenvalues ascending
++          gtil = MATMUL(TRANSPOSE(a), g)
++
++          ALLOCATE(smax(m))
++          smax = solve_subspace(w(1:m), gtil(1:m), a_scale, .TRUE.)
++          IF (n > m) THEN
++            ALLOCATE(smin(n-m))
++            smin = solve_subspace(w(m+1:n), gtil(m+1:n), a_scale, .FALSE.)
++          END IF
++
++          s = 0._q
++          DO k=1,m
++            s = s + a(:,k) * smax(k)
++          END DO
++          IF (n > m) THEN
++            DO k=1,n-m
++              s = s + a(:,m+k) * smin(k)
++            END DO
++            DEALLOCATE(smin)
++          END IF
++
++          DEALLOCATE(a, w, gtil, smax)
++        END FUNCTION prfo_step_with_a
++
++
++        FUNCTION solve_subspace(lam, g, a_scale, pick_max) RESULT(s)
++          REAL(q), INTENT(IN) :: lam(:), g(:), a_scale
++          LOGICAL, INTENT(IN) :: pick_max
++          REAL(q) :: s(SIZE(g))
++
++          INTEGER :: k, naug, idx
++          REAL(q), ALLOCATABLE :: aug(:,:), w(:)
++          REAL(q) :: denom
++
++          k = SIZE(g)
++          IF (k == 0) THEN
++            s = 0._q
++            RETURN
++          END IF
++
++          naug = k + 1
++          ALLOCATE(aug(naug,naug), w(naug))
++          aug = 0._q
++          DO idx=1,k
++            aug(idx,idx) = (a_scale*a_scale) * lam(idx)
++            aug(idx,naug) = a_scale * g(idx)
++            aug(naug,idx) = a_scale * g(idx)
++          END DO
++          CALL dsyev_wrap('V', naug, aug, w)   ! aug becomes eigenvectors
++          IF (pick_max) THEN
++            idx = naug
++          ELSE
++            idx = 1
++          END IF
++
++          denom = aug(naug, idx)
++          IF (ABS(denom) < 1E-12_q) denom = SIGN(1E-12_q, denom + 1E-12_q)
++          s = (a_scale * aug(1:k, idx)) / denom
++
++          DEALLOCATE(aug, w)
++        END FUNCTION solve_subspace
++
++
++        FUNCTION solve_cone_step_alm(n, g, b, e, delta, cos_phi) RESULT(s)
++          INTEGER, INTENT(IN) :: n
++          REAL(q), INTENT(IN) :: g(n), b(n,n), e(n), delta, cos_phi
++          REAL(q) :: s(n)
++
++          REAL(q) :: lam, mu, sigma, eta_t, eps_t, grad_norm, nu
++          REAL(q), PARAMETER :: sigma0 = 1._q, rho = 10._q, alpha = 0.5_q, beta = 1._q
++          REAL(q), PARAMETER :: eps = 1E-6_q, eta = 1E-6_q
++          INTEGER, PARAMETER :: max_outer = 50, max_inner = 200, ls_max = 20
++          REAL(q), PARAMETER :: step_size = 0.5_q, ls_decay = 0.5_q
++          INTEGER :: it
++
++          s = delta * e
++          lam = 0._q
++          mu = 0._q
++          sigma = sigma0
++          eta_t = sigma**(-1._q)
++          eps_t = sigma**(-alpha)
++
++          DO it=1,max_outer
++            CALL minimize_alm(n, s, g, b, e, delta, cos_phi, lam, mu, sigma, MAX(eta_t, CCQN_EPSR), max_inner, step_size, ls_decay, ls_max, grad_norm)
++            CALL cone_violation(n, s, e, delta, cos_phi, CCQN_EPSR, nu, mu, sigma)
++            IF (nu <= eps_t) THEN
++              IF (nu <= eps .AND. grad_norm <= eta) EXIT
++              CALL cone_update_multipliers(n, s, e, delta, cos_phi, CCQN_EPSR, lam, mu, sigma)
++              eta_t = MAX(eta_t/sigma, eta)
++              eps_t = MAX(eps_t/(sigma**beta), eps)
++            ELSE
++              sigma = MIN(1E6_q, sigma*rho)
++              eta_t = MAX(eta_t/sigma, eta)
++              eps_t = MAX(eps_t/(sigma**alpha), eps)
++            END IF
++          END DO
++
++          CALL cone_project(n, s, e, delta, cos_phi, CCQN_EPSR)
++        END FUNCTION solve_cone_step_alm
++
++
++        SUBROUTINE minimize_alm(n, s, g, b, e, delta, cos_phi, lam, mu, sigma, grad_tol, max_inner, step_size, ls_decay, ls_max, grad_norm)
++          INTEGER, INTENT(IN) :: n, max_inner, ls_max
++          REAL(q), INTENT(INOUT) :: s(n)
++          REAL(q), INTENT(IN) :: g(n), b(n,n), e(n), delta, cos_phi, lam, mu, sigma, grad_tol, step_size, ls_decay
++          REAL(q), INTENT(OUT) :: grad_norm
++
++          REAL(q), ALLOCATABLE :: grad(:), s_new(:)
++          REAL(q) :: lval, lnew, step
++          INTEGER :: it, ls
++
++          ALLOCATE(grad(n), s_new(n))
++          DO it=1,max_inner
++            CALL alm_value_grad(n, s, g, b, e, delta, cos_phi, lam, mu, sigma, CCQN_EPSR, lval, grad, grad_norm)
++            IF (grad_norm <= grad_tol) EXIT
++            step = step_size
++            DO ls=1,ls_max
++              s_new = s - step*grad
++              CALL alm_value_only(n, s_new, g, b, e, delta, cos_phi, lam, mu, sigma, CCQN_EPSR, lnew)
++              IF (lnew <= lval - 1E-4_q*step*(grad_norm**2)) THEN
++                s = s_new
++                EXIT
++              END IF
++              step = step*ls_decay
++            END DO
++            IF (ls > ls_max) s = s - step*grad
++          END DO
++          DEALLOCATE(grad, s_new)
++        END SUBROUTINE minimize_alm
++
++
++        SUBROUTINE alm_value_grad(n, s, g, b, e, delta, cos_phi, lam, mu, sigma, epsr, lval, grad, grad_norm)
++          INTEGER, INTENT(IN) :: n
++          REAL(q), INTENT(IN) :: s(n), g(n), b(n,n), e(n), delta, cos_phi, lam, mu, sigma, epsr
++          REAL(q), INTENT(OUT) :: lval, grad(n), grad_norm
++
++          REAL(q), ALLOCATABLE :: bs(:), grad_ceq(:), grad_cin(:)
++          REAL(q) :: r, c_eq, c_ineq, t, fquad
++
++          ALLOCATE(bs(n), grad_ceq(n), grad_cin(n))
++          CALL cone_terms(n, s, e, delta, cos_phi, epsr, r, c_eq, c_ineq, grad_ceq, grad_cin)
++          bs = MATMUL(b, s)
++          fquad = SUM(g*s) + 0.5_q*SUM(s*bs)
++          t = MAX(mu/sigma + c_ineq, 0._q)
++          lval = fquad + lam*c_eq + 0.5_q*sigma*c_eq*c_eq + 0.5_q*sigma*(t*t - (mu/sigma)*(mu/sigma))
++          grad = g + bs + (lam + sigma*c_eq)*grad_ceq + sigma*t*grad_cin
++          grad_norm = SQRT(SUM(grad*grad))
++          DEALLOCATE(bs, grad_ceq, grad_cin)
++        END SUBROUTINE alm_value_grad
++
++
++        SUBROUTINE alm_value_only(n, s, g, b, e, delta, cos_phi, lam, mu, sigma, epsr, lval)
++          INTEGER, INTENT(IN) :: n
++          REAL(q), INTENT(IN) :: s(n), g(n), b(n,n), e(n), delta, cos_phi, lam, mu, sigma, epsr
++          REAL(q), INTENT(OUT) :: lval
++
++          REAL(q), ALLOCATABLE :: bs(:), grad_ceq(:), grad_cin(:)
++          REAL(q) :: r, c_eq, c_ineq, t, fquad
++
++          ALLOCATE(bs(n), grad_ceq(n), grad_cin(n))
++          CALL cone_terms(n, s, e, delta, cos_phi, epsr, r, c_eq, c_ineq, grad_ceq, grad_cin)
++          bs = MATMUL(b, s)
++          fquad = SUM(g*s) + 0.5_q*SUM(s*bs)
++          t = MAX(mu/sigma + c_ineq, 0._q)
++          lval = fquad + lam*c_eq + 0.5_q*sigma*c_eq*c_eq + 0.5_q*sigma*(t*t - (mu/sigma)*(mu/sigma))
++          DEALLOCATE(bs, grad_ceq, grad_cin)
++        END SUBROUTINE alm_value_only
++
++
++        SUBROUTINE cone_terms(n, s, e, delta, cos_phi, epsr, r, c_eq, c_ineq, grad_ceq, grad_cin)
++          INTEGER, INTENT(IN) :: n
++          REAL(q), INTENT(IN) :: s(n), e(n), delta, cos_phi, epsr
++          REAL(q), INTENT(OUT) :: r, c_eq, c_ineq, grad_ceq(n), grad_cin(n)
++
++          r = SQRT(SUM(s*s))
++          IF (r < epsr) r = epsr
++          c_eq = r - delta
++          c_ineq = r*cos_phi - SUM(e*s)
++          grad_ceq = s / r
++          grad_cin = cos_phi*s / r - e
++        END SUBROUTINE cone_terms
++
++
++        SUBROUTINE cone_project(n, s, e, delta, cos_phi, epsr)
++          INTEGER, INTENT(IN) :: n
++          REAL(q), INTENT(INOUT) :: s(n)
++          REAL(q), INTENT(IN) :: e(n), delta, cos_phi, epsr
++
++          REAL(q) :: r, dot, a_target, b_target, b
++          REAL(q), ALLOCATABLE :: perp(:)
++
++          IF (delta <= 0._q) THEN
++            s = 0._q
++            RETURN
++          END IF
++
++          r = SQRT(SUM(s*s))
++          IF (r < epsr) THEN
++            s = delta * e
++            RETURN
++          END IF
++          s = s * (delta / r)
++
++          dot = SUM(e*s)
++          a_target = delta * cos_phi
++          IF (dot >= a_target - 1E-12_q) RETURN
++
++          ALLOCATE(perp(n))
++          perp = s - dot*e
++          b = SQRT(SUM(perp*perp))
++
++          IF (b < epsr) THEN
++            perp = 0._q
++            perp(1) = 1._q
++            perp = perp - SUM(perp*e)*e
++            b = SQRT(SUM(perp*perp))
++            IF (b < epsr .AND. n >= 2) THEN
++              perp = 0._q
++              perp(2) = 1._q
++              perp = perp - SUM(perp*e)*e
++              b = SQRT(SUM(perp*perp))
++            END IF
++            IF (b < epsr .AND. n >= 3) THEN
++              perp = 0._q
++              perp(3) = 1._q
++              perp = perp - SUM(perp*e)*e
++              b = SQRT(SUM(perp*perp))
++            END IF
++          END IF
++
++          IF (b < epsr) THEN
++            perp = 0._q
++            perp(1) = 1._q
++            b = 1._q
++          END IF
++
++          b_target = SQRT(MAX(delta*delta - a_target*a_target, 0._q))
++          s = a_target*e + (b_target/b)*perp
++          DEALLOCATE(perp)
++        END SUBROUTINE cone_project
++
++
++        SUBROUTINE cone_violation(n, s, e, delta, cos_phi, epsr, nu, mu, sigma)
++          INTEGER, INTENT(IN) :: n
++          REAL(q), INTENT(IN) :: s(n), e(n), delta, cos_phi, epsr, mu, sigma
++          REAL(q), INTENT(OUT) :: nu
++
++          REAL(q), ALLOCATABLE :: gce(:), gci(:)
++          REAL(q) :: r, c_eq, c_ineq, t
++
++          ALLOCATE(gce(n), gci(n))
++          CALL cone_terms(n, s, e, delta, cos_phi, epsr, r, c_eq, c_ineq, gce, gci)
++          IF (sigma > 0._q) THEN
++            t = MAX(c_ineq, -mu/sigma)
++          ELSE
++            t = MAX(c_ineq, 0._q)
++          END IF
++          nu = SQRT(c_eq*c_eq + t*t)
++          DEALLOCATE(gce, gci)
++        END SUBROUTINE cone_violation
++
++
++        SUBROUTINE cone_update_multipliers(n, s, e, delta, cos_phi, epsr, lam, mu, sigma)
++          INTEGER, INTENT(IN) :: n
++          REAL(q), INTENT(IN) :: s(n), e(n), delta, cos_phi, epsr, sigma
++          REAL(q), INTENT(INOUT) :: lam, mu
++
++          REAL(q), ALLOCATABLE :: gce(:), gci(:)
++          REAL(q) :: r, c_eq, c_ineq
++
++          ALLOCATE(gce(n), gci(n))
++          CALL cone_terms(n, s, e, delta, cos_phi, epsr, r, c_eq, c_ineq, gce, gci)
++          lam = lam + sigma*c_eq
++          mu = MAX(mu + sigma*c_ineq, 0._q)
++          DEALLOCATE(gce, gci)
++        END SUBROUTINE cone_update_multipliers
++
++!-----------------------------------------------------------------------
++! Local uppercase helper (avoids dependency on string module's uppercase,
++! which is absent in VASP 6.1.x)
++!-----------------------------------------------------------------------
++        PURE FUNCTION ccqn_uppercase(s) RESULT(res)
++          CHARACTER(LEN=*), INTENT(IN) :: s
++          CHARACTER(LEN=LEN(s)) :: res
++          INTEGER :: i, ic
++          res = s
++          DO i = 1, LEN_TRIM(s)
++            ic = IACHAR(s(i:i))
++            IF (ic >= IACHAR('a') .AND. ic <= IACHAR('z')) &
++     &        res(i:i) = ACHAR(ic - 32)
++          END DO
++        END FUNCTION ccqn_uppercase
++
++      END MODULE ccqn_ts
+--- original/src/main.F	2026-03-22 21:20:48
++++ patched/src/main.F	2026-03-22 21:20:50
+@@ -166,2 +166,3 @@
+       USE dimer_heyden
++      USE ccqn_ts
+       USE dvvtrajectory
+@@ -1857,2 +1858,3 @@
+       !tb beg
++      ELSE IF (DYN%IBRION==45) THEN
+       ELSE IF (DYN%IBRION==44) THEN
+@@ -4273,2 +4275,8 @@
+            IF (IFLAG==1) INFO%LSTOP=INFO%LSTOP .OR. (ABS(E1TEST) < 0.1_q*DYN%EDIFFG)
++!-----------------------------------------------------------------------
++! CCQN-TS: cone-shaped constrained quasi-Newton TS optimization
++!-----------------------------------------------------------------------
++        ELSE IF (DYN%IBRION==45) THEN
++           CALL ccqn_ts_opt(DYN,T_INFO,INFO,LATT_CUR,IO,TOTEN,FACT,LSTOP2)
++           TOTENG=TOTEN
+ !-----------------------------------------------------------------------
+--- original/src/makefile	2026-03-22 21:20:48
++++ patched/src/makefile	2026-03-22 21:20:50
+@@ -256,3 +256,3 @@
+ 
+-main.o : main$(SUFFIX)
++main.o : ccqn_ts.o main$(SUFFIX)
+ 	$(FC) $(FREE) $(FFLAGS) $(DEBUG) $(INCS) $(INCMODS) -c $*$(SUFFIX)
