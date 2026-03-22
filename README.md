@@ -1,4 +1,4 @@
-# CCQN-TS: Cone-shaped Constrained Quasi-Newton Transition State Optimizer for VASP
+# VASP-CCQN
 
 Unofficial implementation of the CCQN method for VASP 6.x (6.1–6.6).
 
