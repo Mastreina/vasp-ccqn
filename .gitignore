@@ -1,0 +1,5 @@
+# VASP licensed source archives - never commit
+*.tgz
+*.tar.gz
+# Papers
+*.pdf
