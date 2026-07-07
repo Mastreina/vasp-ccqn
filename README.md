@@ -4,6 +4,7 @@ Unofficial implementation of the CCQN method for VASP 6.x (6.1–6.6).
 
 > Wu, Y.; Wang, H. *J. Chem. Theory Comput.* **2025**, 21, 18, 9054–9065. DOI: [10.1021/acs.jctc.5c01015](https://pubs.acs.org/doi/10.1021/acs.jctc.5c01015)
 
+> Fully optimized by `claude-fable-5`.
 ## Apply
 
 ```bash
